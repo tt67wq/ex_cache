@@ -3,7 +3,7 @@ defmodule ExCache.MixProject do
   use Mix.Project
 
   @name "ex_cache"
-  @version "0.1.0"
+  @version "0.1.1"
   @repo_url "https://github.com/tt67wq/ex_cache"
   @description "A simple cache framework"
 
