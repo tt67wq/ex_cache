@@ -1,5 +1,4 @@
-
-.PHONY: help setup build lint fmt test test.watch repl deps.get deps.update deps.update.all deps.clean deps.compile deps.tree publish
+.PHONY: help setup build lint fmt test test.watch repl deps.get deps.update deps.update.all deps.clean deps.compile deps.tree
 
 .DEFAULT_GOAL := help
 
@@ -14,7 +13,7 @@ setup: ## 初始化开发环境
 	@mix do deps.get, compile
 
 build: ## 编译项目
-	@mix compile
+	@mix compile --warnings-as-errors
 
 ## 代码质量
 lint: ## 静态代码检查
@@ -46,11 +45,8 @@ deps.update.all: ## 更新所有依赖
 deps.clean: ## 清理未使用的依赖
 	@mix deps.clean --unused
 
-deps.compile: ## 编译项目依赖
-	@mix deps.compile
-
 deps.tree: ## 显示依赖树状结构
 	@mix deps.tree
 
-publish: ## 发布到 Hex
-	@mix hex.publish
+publish: ## 发布项目到 Hex
+	@mix hex.publish --yes
