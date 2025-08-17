@@ -4,7 +4,7 @@ defmodule ExCache.Ets do
 
   This module provides a cache implementation using ETS (Erlang Term Storage)
   as the underlying storage mechanism. It supports TTL (Time To Live) for automatic
-  expiration of cached values.
+  expiration of cached values and comprehensive statistics tracking.
 
   ## Features
 
@@ -13,6 +13,7 @@ defmodule ExCache.Ets do
   - Asynchronous operations (put/delete)
   - Synchronous read operations
   - Automatic cleanup of expired entries
+  - Cache statistics and performance monitoring
 
   ## Usage
 
@@ -45,6 +46,25 @@ defmodule ExCache.Ets do
       ]
 
       Supervisor.start_link(children, strategy: :one_for_one)
+
+  ## Statistics
+
+  The cache provides comprehensive statistics that can be retrieved using `stats/1`:
+
+      # Get cache statistics
+      stats = ExCache.Ets.stats(:my_cache)
+      # => %{
+      #   hits: 150,
+      #   misses: 25,
+      #   puts: 175,
+      #   deletes: 30,
+      #   total_operations: 380
+      # }
+
+  Statistics can be reset using `reset_stats/1`:
+
+      # Reset all statistics
+      :ok = ExCache.Ets.reset_stats(:my_cache)
   """
 
   use ExCache
@@ -147,6 +167,73 @@ defmodule ExCache.Ets do
     GenServer.cast(name, {:del, key})
   end
 
+  @doc """
+  Get cache statistics.
+
+  ## Parameters
+
+  - `name`: The cache process name or pid
+
+  ## Returns
+
+  A map containing cache statistics:
+  - `:hits` - Number of cache hits
+  - `:misses` - Number of cache misses
+  - `:puts` - Number of put operations
+  - `:deletes` - Number of delete operations
+  - `:total_operations` - Total number of operations
+
+  ## Examples
+
+      iex> ExCache.Ets.put(:my_cache, :key, "value")
+      :ok
+      iex> ExCache.Ets.get(:my_cache, :key)
+      "value"
+      iex> stats = ExCache.Ets.stats(:my_cache)
+      iex> stats.hits
+      1
+      iex> stats.puts
+      1
+  """
+  @spec stats(ExCache.t()) :: %{
+          hits: non_neg_integer(),
+          misses: non_neg_integer(),
+          puts: non_neg_integer(),
+          deletes: non_neg_integer(),
+          total_operations: non_neg_integer()
+        }
+  def stats(name) do
+    GenServer.call(name, :stats)
+  end
+
+  @doc """
+  Reset cache statistics.
+
+  ## Parameters
+
+  - `name`: The cache process name or pid
+
+  ## Returns
+
+  `:ok` if the operation was successful
+
+  ## Examples
+
+      iex> ExCache.Ets.put(:my_cache, :key, "value")
+      :ok
+      iex> ExCache.Ets.get(:my_cache, :key)
+      "value"
+      iex> ExCache.Ets.reset_stats(:my_cache)
+      :ok
+      iex> stats = ExCache.Ets.stats(:my_cache)
+      iex> stats.hits
+      0
+  """
+  @spec reset_stats(ExCache.t()) :: :ok
+  def reset_stats(name) do
+    GenServer.cast(name, :reset_stats)
+  end
+
   # ------------------- server ----------------------
 
   defp ets_name(name) do
@@ -157,11 +244,25 @@ defmodule ExCache.Ets do
   def init(name) do
     table = ets_name(name)
     :ets.new(table, [:named_table, :public, :set])
-    {:ok, table, @timeout}
+
+    state = %{
+      table: table,
+      stats: %{
+        hits: 0,
+        misses: 0,
+        puts: 0,
+        deletes: 0,
+        total_operations: 0
+      }
+    }
+
+    {:ok, state, @timeout}
   end
 
   @impl GenServer
-  def handle_call({:get, key}, _, table) do
+  def handle_call({:get, key}, _, state) do
+    %{table: table, stats: stats} = state
+
     val =
       case :ets.lookup(table, key) do
         [{^key, value, :infinity}] ->
@@ -179,44 +280,164 @@ defmodule ExCache.Ets do
           nil
       end
 
-    {:reply, val, table}
+    # Update statistics
+    updated_stats =
+      if val != nil do
+        %{stats | hits: stats.hits + 1, total_operations: stats.total_operations + 1}
+      else
+        %{stats | misses: stats.misses + 1, total_operations: stats.total_operations + 1}
+      end
+
+    updated_state = %{state | stats: updated_stats}
+    {:reply, val, updated_state}
   end
 
   @impl GenServer
-  def handle_cast({:del, key}, table) do
-    :ets.delete(table, key)
-    {:noreply, table}
-  end
-
-  def handle_cast({:put, key, value, ttl: :infinity}, table) do
-    :ets.insert(table, {key, value, :infinity})
-    {:noreply, table}
-  end
-
-  def handle_cast({:put, key, value, ttl: ttl}, table) when is_integer(ttl) and ttl > 0 do
-    :ets.insert(table, {key, value, :os.system_time(:millisecond) + ttl})
-    {:noreply, table}
-  end
-
-  def handle_cast({:put, key, value, ttl: _invalid_ttl}, table) do
-    # Treat invalid TTL values as infinity
-    :ets.insert(table, {key, value, :infinity})
-    {:noreply, table}
+  def handle_call(:stats, _, state) do
+    %{stats: stats} = state
+    {:reply, stats, state}
   end
 
   @impl GenServer
-  def handle_info(:timeout, table) do
+  def handle_call(:cleanup_expired, _, state) do
+    %{table: table} = state
     now = :os.system_time(:millisecond)
 
-    :ets.select_delete(
-      table,
-      [
-        {{:"$1", :"$2", :infinity}, [], [false]},
-        {{:"$1", :"$2", :"$3"}, [{:<, :"$3", now}], [true]},
-        {:_, [], [false]}
-      ]
-    )
+    # Count and delete expired entries
+    deleted_count =
+      :ets.select_delete(
+        table,
+        [
+          {{:"$1", :"$2", :infinity}, [], [false]},
+          {{:"$1", :"$2", :"$3"}, [{:<, :"$3", now}], [true]},
+          {:_, [], [false]}
+        ]
+      )
 
-    {:noreply, table, @timeout}
+    {:reply, {:ok, deleted_count}, state}
+  end
+
+  @impl GenServer
+  def handle_cast({:del, key}, state) do
+    %{table: table, stats: stats} = state
+    :ets.delete(table, key)
+
+    # Update statistics
+    updated_stats = %{stats | deletes: stats.deletes + 1, total_operations: stats.total_operations + 1}
+    updated_state = %{state | stats: updated_stats}
+
+    {:noreply, updated_state}
+  end
+
+  @impl GenServer
+  def handle_cast(:reset_stats, state) do
+    reset_stats = %{
+      hits: 0,
+      misses: 0,
+      puts: 0,
+      deletes: 0,
+      total_operations: 0
+    }
+
+    updated_state = %{state | stats: reset_stats}
+    {:noreply, updated_state}
+  end
+
+  def handle_cast({:put, key, value, ttl: :infinity}, state) do
+    %{table: table, stats: stats} = state
+    :ets.insert(table, {key, value, :infinity})
+
+    # Update statistics
+    updated_stats = %{stats | puts: stats.puts + 1, total_operations: stats.total_operations + 1}
+    updated_state = %{state | stats: updated_stats}
+
+    {:noreply, updated_state}
+  end
+
+  def handle_cast({:put, key, value, ttl: ttl}, state) when is_integer(ttl) and ttl > 0 do
+    %{table: table, stats: stats} = state
+    :ets.insert(table, {key, value, :os.system_time(:millisecond) + ttl})
+
+    # Update statistics
+    updated_stats = %{stats | puts: stats.puts + 1, total_operations: stats.total_operations + 1}
+    updated_state = %{state | stats: updated_stats}
+
+    {:noreply, updated_state}
+  end
+
+  def handle_cast({:put, key, value, ttl: _invalid_ttl}, state) do
+    %{table: table, stats: stats} = state
+    # Treat invalid TTL values as infinity
+    :ets.insert(table, {key, value, :infinity})
+
+    # Update statistics
+    updated_stats = %{stats | puts: stats.puts + 1, total_operations: stats.total_operations + 1}
+    updated_state = %{state | stats: updated_stats}
+
+    {:noreply, updated_state}
+  end
+
+  @impl GenServer
+  def handle_info(:timeout, state) do
+    %{table: table} = state
+    now = :os.system_time(:millisecond)
+
+    # Optimized cleanup strategy:
+    # 1. Use select_delete for efficient batch deletion
+    # 2. First count expired entries for statistics
+    # 3. Then delete them in one operation
+    expired_count =
+      :ets.select_count(
+        table,
+        [
+          {{:"$1", :"$2", :"$3"}, [{:<, :"$3", now}], [true]}
+        ]
+      )
+
+    if expired_count > 0 do
+      # Delete all expired entries in one operation
+      deleted_count =
+        :ets.select_delete(
+          table,
+          [
+            {{:"$1", :"$2", :infinity}, [], [false]},
+            {{:"$1", :"$2", :"$3"}, [{:<, :"$3", now}], [true]},
+            {:_, [], [false]}
+          ]
+        )
+
+      # Log cleanup activity (could be enhanced with telemetry)
+      if deleted_count > 0 do
+        :logger.debug("[ExCache] Cleaned up #{deleted_count} expired entries")
+      end
+    end
+
+    {:noreply, state, @timeout}
+  end
+
+  @doc """
+  Manually trigger cleanup of expired entries.
+
+  This function can be called to manually clean up expired entries
+  without waiting for the automatic timeout-based cleanup.
+
+  ## Parameters
+
+  - `name`: The cache process name or pid
+
+  ## Returns
+
+  `{:ok, deleted_count}` where deleted_count is the number of entries that were deleted
+
+  ## Examples
+
+      iex> {:ok, count} = ExCache.Ets.cleanup_expired(:my_cache)
+      iex> count
+      5
+
+  """
+  @spec cleanup_expired(ExCache.t()) :: {:ok, non_neg_integer()}
+  def cleanup_expired(name) do
+    GenServer.call(name, :cleanup_expired)
   end
 end
